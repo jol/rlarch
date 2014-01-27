@@ -1,0 +1,499 @@
+#!/usr/bin/env python
+
+# going to explore installed packaged.
+import os
+import pkg_resources
+import subprocess
+import tempfile
+import shutil
+import sys
+import fileinput
+import struct
+
+# should have a pacman.conf reader.
+root      ="/"
+db_path   = os.path.join(root, 'var/lib/pacman')
+local_db  = os.path.join(db_path, 'local')
+sync_db   = os.path.join(db_path, 'sync')
+cache_dir = "/home/jol/tmp"
+
+url_download = 'http://mir.archlinux.fr'
+
+databases = {'core' : 'core.db',
+             'extra': 'extra.db',
+             'community': 'community.db'}
+
+
+def setup_vars(prefix):
+    global root, db_path, local_db
+    global sync_db
+
+    root = prefix
+    db_path   = os.path.join(root, 'var/lib/pacman')
+    local_db  = os.path.join(db_path, 'local')
+    sync_db   = os.path.join(db_path, 'sync')
+
+
+
+def parse_local_desc(fd):
+    """
+    Parse local description of a package.
+    @param filename: the filename of description.
+    """
+    result = {}
+    current_cat = ''
+    for line in fd.readlines():
+        if '%' in line:
+            current_cat = line[:-1].replace('%', '')
+            continue
+        if line == '\n': continue
+        if current_cat != '':
+                result.setdefault(current_cat, []).append(line[:-1])
+    return result
+
+
+def detect_installed_packages(local_db_path):
+    """
+    @param local_db_path: the local db path.
+    @return a map indexed by package name. Value
+    are a tuple (version, revision, description_map)
+    """
+    # detect installed package.
+    installed_db = {} # indexed by program name.
+    for soft in os.listdir(local_db_path):
+        name, version, revision = soft.rsplit('-', 2)
+        version = pkg_resources.parse_version(version + "-" + revision)
+        # read depends.
+        descr = os.path.join(local_db,
+                            soft, 'desc')
+        descr = parse_local_desc(open(descr))
+        installed_db[name] = (version, descr)
+    
+    return installed_db
+
+
+def read_incoming_database(db_name, incoming_db_filename):
+    """
+    Read the incoming database filename.
+
+    @return a map indexed by package name.
+    """
+    import tarfile, zlib
+
+    tar = tarfile.open(incoming_db_filename, 'r:gz')
+    name = ''; version = ''
+    result = {}
+    for tarinfo in tar:
+        # fetch version from directory.
+        if tarinfo.isdir():
+            name, version, revision = tarinfo.name.rsplit('-', 2)
+            version = pkg_resources.parse_version(version + "-" + revision)
+            
+        # extract depends information.
+        elif tarinfo.isfile():
+            if "/depends" in tarinfo.name:
+                depends = parse_local_desc(tar.extractfile(tarinfo))
+                result[name] = (version, depends, db_name)
+        
+    return result
+
+
+def read_incoming_desc(packages, db_name, incoming_db_filename):
+    """
+    Read the description from the incoming database.
+    The description are limited to the packages set
+    passed by parameter.
+    """
+    import tarfile, zlib
+
+    tar = tarfile.open(incoming_db_filename, 'r:gz')
+    name = ''; version = ''
+    result = {}
+    for tarinfo in tar:
+        # fetch version from directory.
+        if tarinfo.isdir():
+            name, version, revision = tarinfo.name.rsplit('-', 2)
+            version = pkg_resources.parse_version(version + "-" + revision)
+            continue
+        
+        # extract depends information.
+        elif tarinfo.isfile():
+            if name  not in packages: continue
+            
+            if "/desc" in tarinfo.name:
+                desc = parse_local_desc(tar.extractfile(tarinfo))
+                result[name] = (version, desc, db_name)
+        
+    return result
+    
+
+
+def _order_packages_to_update(update_packages,
+                              installed_packages,
+                              db_packages,
+                              already_scheduled = {}
+                              ):
+    """
+    Order Packages in to a vector depends on
+    their dependency, moreover, it will add required
+    packages.
+    """
+    tmp = []
+    for name in update_packages:
+
+        # extract name.
+        # ... TODO: do it better.
+        if ">=" in name: name = name.split('>=')[0]
+        if "==" in name: name = name.split('==')[0]
+        
+        # check if already scheduled
+        if name in already_scheduled: continue
+        
+        # get depends
+        db_pkg = db_packages.get(name)
+        if db_pkg is None: continue
+        
+        deps = db_pkg[1].get('DEPENDS')
+        if deps is None:
+            tmp.append(name)
+            already_scheduled[name] = 1
+            continue
+        
+        # process dependencies.
+        tmp += _order_packages_to_update(deps,
+                                         installed_packages,
+                                         db_packages,
+                                         already_scheduled)
+
+        # the current name
+        if name in already_scheduled:
+            print("strange: '%s' should not be already in the queue" % (name))
+            continue
+
+        
+        # compare the version between installed 
+        if name not in installed_packages or \
+           db_packages[name][0] > installed_packages[name][0]:
+            # append the current package.
+            tmp.append(name)
+            already_scheduled[name] = 1
+
+    return tmp
+
+
+def update_installed_package(installed_packages,
+                             db_packages):
+    """
+    @return a tuple of (update or install pkgs, no present in db)
+    """
+    packages_to_update = []
+    packages_missing = []
+    for name, oldpkg in installed_packages.iteritems():
+        # check if the package continue to exists.
+        npkg = db_packages.get(name)
+        if npkg is None:
+            packages_missing.append(name)
+        elif npkg[0] > oldpkg[0]:
+            packages_to_update.append(name)
+
+    # order packages.
+    packages_to_update = _order_packages_to_update(packages_to_update,
+                                                   installed_packages,
+                                                   db_packages)
+    return packages_to_update, packages_missing
+
+
+def download_package(source, target, md5sum=None):
+
+    #xfer_command = "/usr/bin/curl -C - -f %u > %o"
+    # /usr/bin/wget --passive-ftp -c -O %o %u
+    # download using curl.
+    if os.path.exists(target) and md5sum:
+        # on file exists, we check 
+        output = subprocess.check_output(["md5sum", target])
+        compute_md5sum = output.split(' ')[0]
+    
+        if md5sum == compute_md5sum:
+            return 0
+        print "wrong checksum, deleting file: ", target
+        os.unlink(target)
+    
+    print "downloading: ", source, target    
+    retcode = subprocess.call(["/usr/bin/wget", "-c", "-O", target, source ])
+    
+
+def download_databases(from_url, databases, target_dir):
+    """
+    Download databases to the directory.
+    """
+    # url: http://.../database/os/arch/database.db
+    for db in databases:
+        #python 3: os.uname().machine
+        db_url = '%s/%s/os/%s/%s.db' % (from_url, db, os.uname()[4], db)
+        db_target = '%s/%s.db' % (target_dir, db)
+        download_package(db_url, db_target)
+
+
+def uncompress_archive(filename):
+    """
+    uncompress a xz archive into a directory.
+    @param filename: the archive filename
+    @output_dir: the output directory.
+    @return the directory where the archive has been extracted.
+    The caller has to remove the directory.
+    """
+    # create the temporary output directory.
+    tmp_dir = tempfile.mkdtemp()
+
+    shutil.copy(filename, tmp_dir)
+    filename = os.path.join(tmp_dir, os.path.basename(filename))
+    retcode  = subprocess.call(["xz", "-d", filename])
+    filename = filename[:-3]
+    retcode  = subprocess.call(["tar", "xf", filename, "-C", tmp_dir])
+    os.unlink(filename)
+
+    return tmp_dir
+
+
+def _file_replace_inplace(filename, replaces):
+    """
+    Make a replace inplace in a file.
+    @param filename: the filename that will be updated.
+    @param search: the search pattern.
+    @param replace: the replace Value
+    @return the number of line changed.
+    """
+    count = 0
+    for line in fileinput.input(filename, inplace=1):
+        
+        for r in replaces:
+            if r[0] in line:
+                line = line.replace(r[0], r[1])
+                count += 1
+        sys.stdout.write(line)
+            
+    return count
+
+
+
+def _is_elf_file(filename):
+    """
+    Check if the file is an ELF file.
+    """
+    if os.path.getsize(filename) < 4: return False
+    f = open(filename, 'rb')
+    header = struct.unpack('4c', f.read(4))
+    return ('\x7f', 'E', 'L', 'F') == header
+
+
+
+def _list_elf_files(dirname):
+    """
+    List all elf file present in the hierarchy
+    """
+    def _over(arg, dirname, fnames):
+        for f in fnames:
+            p = os.path.join(dirname, f)
+            if not os.path.isfile(p): continue
+            if _is_elf_file(p):
+                arg.append(p)
+    tmp = []
+    os.path.walk(dirname, _over, tmp)
+    return tmp
+
+
+def _patch_elf_file(filename, new_root_path, replaces):
+    # get current rpath
+    cmds = ["patchelf", "--print-rpath", filename]
+    try:
+        # get rpath and change it.
+        rpath = subprocess.check_output(cmds)
+        for r in replaces:
+            rpath = rpath.replace(r[0], r[1])
+
+        # set rpath
+        cmds = ["patchelf", "--set-rpath", rpath, filename]
+        retcode = subprocess.call(cmds)
+
+    except Exception, e:
+        print "+++Error: ", e
+
+
+def rewrite_path(package_dir, new_root_path):
+    """
+    @param package_dir: the package directory.
+    @param new_root_path: the root path used to rewrite
+    """
+    # list of file that maybe rewritten.
+    cmds = ["find",  package_dir, 
+            "!", "-name", "*.h", 
+            "!", "-name", ".html", 
+            "!", "-name", "*.hpp",
+            "-type", "f", 
+            "-exec", "grep", "-Il", ".", "{}", ";"]
+    outputs = subprocess.check_output(cmds)
+    
+    # use sed inplace to replace /usr by the new root path.
+    to_replace = [
+        ['/usr', os.path.join(new_root_path, 'usr')],
+        ['/etc', os.path.join(new_root_path, 'etc')],
+        ['/var', os.path.join(new_root_path, 'var')],   
+    ]
+
+    count_text_modified = 0
+    for f in outputs[:-1].split('\n'):
+        count = _file_replace_inplace(f, to_replace)
+        if count: count_text_modified += 1
+    print "number of rewritten text file:", count_text_modified
+    
+
+    # now patch binary file, find all elf file inside
+    # a directory. once found, execute the patchelf command
+    elf_files = _list_elf_files(package_dir)
+    for e in elf_files:
+        _patch_elf_file(e, new_root_path, to_replace)
+
+    return
+    
+
+
+def params():
+    import optparse
+
+    parser = optparse.OptionParser()
+
+    # --> Verbosity
+    parser.add_option('-v', '--verbose',
+                    action = 'store_true',
+                    dest = 'verbose',
+                    default = False,
+                    help = 'enable verbose messages [default: %default]')
+
+    parser.add_option('-E', '--env',
+                       action= 'store',
+                       dest='env',
+                       default=os.environ.get('RLARCH_PREFIX'))
+
+    parser.add_option('-S',
+                       action='store_true',
+                       dest='synchronize',
+                       default = False,
+                       help = 'Synchronize package.')
+
+    parser.add_option('-y',
+                       action='store_true',
+                       dest='fetch_db',
+                       default = False,
+                       help = 'Update the database from the Official ArchLinux repository.')
+
+    parser.add_option('--from-url',
+                       action = 'store',
+                       dest='from_url',
+                       default = 'http://mir.archlinux.fr',
+                       help= 'The url used to download database and packages.')
+
+    parser.add_option('--databases',
+                      action='store',
+                      dest='databases',
+                      default='core,extra,community',
+                      help='List of comma separated databases.')
+
+    config, args = parser.parse_args()
+    if config.databases:
+        config.databases = config.databases.split(',')
+
+    return config, args
+
+
+if __name__ == '__main__':
+
+    # create parser
+    config, packages = params()
+
+    # make sure that environnement is defined.
+    if config.env is None:
+        print "you have to define the prefix to use through the RLARCH_PREFIX variable or --env parameter."
+        sys.exit(1)
+
+    # make sure that the directory exists.
+    # TODO: create a check env function that will ensure that basic requirements are present.
+    if not os.path.exists(config.env):
+        print "the environnement '%s' does not exist, you have to bootstrap it." % (config.env)
+        sys.exit(1)
+
+    setup_vars(config.env)
+
+
+    # synchronize stuff
+    if config.synchronize:
+        if config.fetch_db:
+            # make sure that the target dictionary exists.
+            if not os.path.exists(sync_db): os.makedirs(sync_db)
+            print "going to synchronize database."
+            download_databases(config.from_url, config.databases, sync_db)
+
+
+
+if 0:
+    # read local database
+    installed_packages = detect_installed_packages(local_db)
+    print("nb installed packages: ", len(installed_packages))
+
+    # read all databases defined in databases variable.
+    db_packages = {}
+    for db_name, db_file in databases.iteritems():
+        db_file = os.path.join(sync_db, db_file)
+        pkgs = read_incoming_database(db_name, db_file)
+        db_packages.update(pkgs)
+        print("%s packages: %d" % (db_name, len(pkgs)))
+    
+    # example to install kdelibs.
+    to_update, _ = update_installed_package({ "perl" : (pkg_resources.parse_version('0.0.0'))},
+                                            db_packages)
+
+    # prepare to get information in order to make download.
+    updates_per_db = {}
+    for name in to_update:
+        pkg = db_packages[name]
+        updates_per_db.setdefault(pkg[2], []).append(name)
+
+    updates_desc = {}
+    for db_name, db_file in databases.iteritems():
+
+        pkgs = updates_per_db.get(db_name)
+        if pkgs is None: continue
+        
+        db_file = os.path.join(sync_db, db_file)
+        pkgs = read_incoming_desc(pkgs, db_name, db_file)
+        updates_desc.update(pkgs)
+
+    #print updates_desc
+
+
+    # going to iterate to db update.
+    for pkg in to_update:
+        desc     = updates_desc[pkg][1]
+        filename = desc['FILENAME'][0]
+        db_name  = db_packages[pkg][2]
+        md5sum_expected = desc['MD5SUM'][0]
+
+        # build source & target.
+        source_url =  '%s/%s/os/x86_64/%s' % (url_download, db_name, filename)
+        target_url = '%s/%s' % (cache_dir, filename)
+
+        # download
+        download_package(source_url, target_url, md5sum = md5sum_expected)
+
+        # note we should check if md5sum are valid.
+
+
+        # uncompress xz into temporary directory.
+        tmp_dir = uncompress_archive(target_url)
+        print pkg, tmp_dir
+        
+        # rewrite rpath and other files.
+        rewrite_path(tmp_dir, "/home/jol/tmp/rlarch.test")
+
+        # uninstall previous package.
+
+        # copy file.
