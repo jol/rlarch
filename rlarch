@@ -15,6 +15,7 @@ root      ="/"
 db_path   = os.path.join(root, 'var/lib/pacman')
 local_db  = os.path.join(db_path, 'local')
 sync_db   = os.path.join(db_path, 'sync')
+
 cache_dir = "/home/jol/tmp"
 
 url_download = 'http://mir.archlinux.fr'
@@ -32,7 +33,7 @@ def setup_vars(prefix):
     db_path   = os.path.join(root, 'var/lib/pacman')
     local_db  = os.path.join(db_path, 'local')
     sync_db   = os.path.join(db_path, 'sync')
-
+    #cache_dir
 
 
 def parse_local_desc(fd):
@@ -96,6 +97,24 @@ def read_incoming_database(db_name, incoming_db_filename):
                 result[name] = (version, depends, db_name)
         
     return result
+
+
+def read_databases(databases, db_path):
+    """
+    Read incoming database
+    @param databases: array of databases
+    @param db_path: directory where to find the read databases.
+    
+    @return a map indexed by package name.
+    """
+    # read all databases defined in databases variable.
+    db_packages = {}
+    for db_name in databases:
+        db_file = os.path.join(sync_db, db_name + '.db')
+        pkgs = read_incoming_database(db_name, db_file)
+        db_packages.update(pkgs)
+        
+    return db_packages
 
 
 def read_incoming_desc(packages, db_name, incoming_db_filename):
@@ -356,6 +375,42 @@ def rewrite_path(package_dir, new_root_path):
     return
     
 
+def update_packages(packages, descriptions, db_packages, 
+                    url, cache_dir, root_dir):
+
+    # make sure that the cache directory exists
+    # TODO: we should move this part.
+    if not os.path.exists(cache_dir): os.makedirs(cache_dir)
+
+
+    for pkg in to_update:
+        desc     = descriptions[pkg][1]
+        filename = desc['FILENAME'][0]
+        db_name  = db_packages[pkg][2]
+        md5sum_expected = desc['MD5SUM'][0]
+
+        # build source & target.
+        source_url =  '%s/%s/os/x86_64/%s' % (url, db_name, filename)
+        target_url = '%s/%s' % (cache_dir, filename)
+
+        # download
+        download_package(source_url, target_url, md5sum = md5sum_expected)
+
+        # note we should check if md5sum are valid.
+
+        # uncompress xz into temporary directory.
+        tmp_dir = uncompress_archive(target_url)
+        print pkg, tmp_dir
+        
+        # rewrite rpath and other files.
+        rewrite_path(tmp_dir, root_dir)
+
+        # uninstall previous package.
+
+        # copy file.
+
+        # should destroy the temporary directory.
+
 
 def params():
     import optparse
@@ -385,6 +440,12 @@ def params():
                        dest='fetch_db',
                        default = False,
                        help = 'Update the database from the Official ArchLinux repository.')
+
+    parser.add_option('-u',
+                       action='store_true',
+                       dest='upgrade',
+                       default = False,
+                       help = 'Upgrade packages of the system')
 
     parser.add_option('--from-url',
                        action = 'store',
@@ -431,6 +492,58 @@ if __name__ == '__main__':
             if not os.path.exists(sync_db): os.makedirs(sync_db)
             print "going to synchronize database."
             download_databases(config.from_url, config.databases, sync_db)
+
+        if config.upgrade:
+            # list installed packages
+            installed_packages = detect_installed_packages(local_db)
+            print("nb installed packages: ", len(installed_packages))
+
+            # read databases
+            available_packages = read_databases(config.databases, sync_db)
+
+            # determine which package to update.
+            to_update, _ = update_installed_package(installed_packages,
+                                                    available_packages)
+
+            # prepare download.
+        
+        if len(packages):
+            # split packages and make an empty vertion.
+            packages_to_install = {}
+            for p in packages: packages_to_install[p] = pkg_resources.parse_version('0.0.0')
+
+            # read databases
+            print "reading databases:", config.databases
+            db_packages = read_databases(config.databases, sync_db)
+
+            # determine which package to update.
+            to_update, _ = update_installed_package(packages_to_install,
+                                                    db_packages)
+
+            print "reading description for: ", to_update
+
+            # group per database
+            updates_per_db = {}
+            for name in to_update:
+                pkg = db_packages[name]
+                updates_per_db.setdefault(pkg[2], []).append(name)
+
+
+            # load descriptions.
+            descriptions = {}
+            for db_name in config.databases:
+
+                pkgs = updates_per_db.get(db_name)
+                if pkgs is None: continue
+        
+                db_file = os.path.join(sync_db, db_name + '.db')
+                pkgs = read_incoming_desc(pkgs, db_name, db_file)
+                descriptions.update(pkgs)
+
+            # update packages.
+            update_packages(to_update, descriptions, db_packages,
+                            config.from_url, cache_dir, config.env)            
+
 
 
 
