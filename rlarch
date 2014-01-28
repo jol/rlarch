@@ -16,7 +16,7 @@ db_path   = os.path.join(root, 'var/lib/pacman')
 local_db  = os.path.join(db_path, 'local')
 sync_db   = os.path.join(db_path, 'sync')
 
-cache_dir = "/home/jol/tmp"
+cache_dir = os.path.join(root, 'var/cache/pacman/pkg')
 
 url_download = 'http://mir.archlinux.fr'
 
@@ -27,13 +27,13 @@ databases = {'core' : 'core.db',
 
 def setup_vars(prefix):
     global root, db_path, local_db
-    global sync_db
+    global sync_db, cache_dir
 
     root = prefix
     db_path   = os.path.join(root, 'var/lib/pacman')
     local_db  = os.path.join(db_path, 'local')
     sync_db   = os.path.join(db_path, 'sync')
-    #cache_dir
+    cache_dir = os.path.join(root, 'var/cache/pacman/pkg')
 
 
 def parse_local_desc(fd):
@@ -322,21 +322,33 @@ def _list_elf_files(dirname):
 
 
 def _patch_elf_file(filename, new_root_path, replaces):
+    
+    # TODO: we could put this stuff outside.
+    mandatory_rpath = [os.path.join(new_root_path, p) for p in ['usr/lib', 'usr/local/lib', 'lib']]
+    mandatory_rpath = ':'.join(mandatory_rpath)
+
     # get current rpath
     cmds = ["patchelf", "--print-rpath", filename]
     try:
         # get rpath and change it.
         rpath = subprocess.check_output(cmds)
+
+        # we should add other rpath: /usr/lib:/usr/local/lib:/lib
         for r in replaces:
             rpath = rpath.replace(r[0], r[1])
+        rpath = '%s:%s' % (rpath.replace('\n', ''), mandatory_rpath)
 
         # set rpath
         cmds = ["patchelf", "--set-rpath", rpath, filename]
         retcode = subprocess.call(cmds)
 
     except Exception, e:
-        print "+++Error: ", e
+        #if not rpath.startswith('cannot find'):
+        #    print "failed to patch ELF file '%s'; error(%s)" % (filename, str(e))
+        #    return False
+        pass
 
+    return True
 
 def rewrite_path(package_dir, new_root_path):
     """
@@ -363,7 +375,7 @@ def rewrite_path(package_dir, new_root_path):
     for f in outputs[:-1].split('\n'):
         count = _file_replace_inplace(f, to_replace)
         if count: count_text_modified += 1
-    print "number of rewritten text file:", count_text_modified
+    #print "number of rewritten text file:", count_text_modified
     
 
     # now patch binary file, find all elf file inside
@@ -375,7 +387,35 @@ def rewrite_path(package_dir, new_root_path):
     return
     
 
-def update_packages(packages, descriptions, db_packages, 
+def _merge_directory(source_dir, target_dir):
+    """
+    used to move the contents of source directory
+    to the target directoy.
+    """
+
+    skip_files = [os.path.join(source_dir, x) for x in [
+        'var/lock'
+    ]]
+
+    for src_dir, dirs, files in os.walk(source_dir):
+        dst_dir = src_dir.replace(source_dir, target_dir)
+        
+        if not os.path.exists(dst_dir):
+            os.mkdir(dst_dir)
+        for file_ in files:
+            src_file = os.path.join(src_dir, file_)
+            dst_file = os.path.join(dst_dir, file_)
+            if os.path.exists(dst_file):
+                os.remove(dst_file)
+            
+            if src_file in skip_files: continue
+            try:
+                shutil.copy2(src_file, dst_dir)
+            except Exception, e:
+                print "+++ failed to copy file: ", src_file
+
+def update_packages(packages, descriptions, 
+                    installed_packages, db_packages, 
                     url, cache_dir, root_dir):
 
     # make sure that the cache directory exists
@@ -400,16 +440,20 @@ def update_packages(packages, descriptions, db_packages,
 
         # uncompress xz into temporary directory.
         tmp_dir = uncompress_archive(target_url)
-        print pkg, tmp_dir
         
         # rewrite rpath and other files.
         rewrite_path(tmp_dir, root_dir)
 
         # uninstall previous package.
+        if pkg in installed_packages:
+            print "+++ we have to uninstall", pkg
 
         # copy file.
+        _merge_directory(tmp_dir, root_dir)
 
         # should destroy the temporary directory.
+
+        # generate local save.
 
 
 def params():
@@ -428,6 +472,12 @@ def params():
                        action= 'store',
                        dest='env',
                        default=os.environ.get('RLARCH_PREFIX'))
+
+    parser.add_option('--create-env',
+                       action='store_true',
+                       dest='create_env',
+                       default=False,
+                       help= 'use this option to bootstrap an environnement.')
 
     parser.add_option('-S',
                        action='store_true',
@@ -482,7 +532,12 @@ if __name__ == '__main__':
         print "the environnement '%s' does not exist, you have to bootstrap it." % (config.env)
         sys.exit(1)
 
-    setup_vars(config.env)
+    setup_vars(config.env) 
+
+    if config.create_env:
+        for d in [local_db, sync_db, cache_dir]:
+            if not os.path.exists(d):
+                os.makedirs(d)
 
 
     # synchronize stuff
@@ -511,6 +566,10 @@ if __name__ == '__main__':
             # split packages and make an empty vertion.
             packages_to_install = {}
             for p in packages: packages_to_install[p] = pkg_resources.parse_version('0.0.0')
+
+            # read installed packages.
+            installed_packages = detect_installed_packages(local_db)
+            print("nb installed packages: ", len(installed_packages))
 
             # read databases
             print "reading databases:", config.databases
@@ -541,72 +600,7 @@ if __name__ == '__main__':
                 descriptions.update(pkgs)
 
             # update packages.
-            update_packages(to_update, descriptions, db_packages,
+            if not os.path.exists(cache_dir): os.makedirs(cachedir)
+            update_packages(to_update, descriptions, 
+                            installed_packages, db_packages,
                             config.from_url, cache_dir, config.env)            
-
-
-
-
-if 0:
-    # read local database
-    installed_packages = detect_installed_packages(local_db)
-    print("nb installed packages: ", len(installed_packages))
-
-    # read all databases defined in databases variable.
-    db_packages = {}
-    for db_name, db_file in databases.iteritems():
-        db_file = os.path.join(sync_db, db_file)
-        pkgs = read_incoming_database(db_name, db_file)
-        db_packages.update(pkgs)
-        print("%s packages: %d" % (db_name, len(pkgs)))
-    
-    # example to install kdelibs.
-    to_update, _ = update_installed_package({ "perl" : (pkg_resources.parse_version('0.0.0'))},
-                                            db_packages)
-
-    # prepare to get information in order to make download.
-    updates_per_db = {}
-    for name in to_update:
-        pkg = db_packages[name]
-        updates_per_db.setdefault(pkg[2], []).append(name)
-
-    updates_desc = {}
-    for db_name, db_file in databases.iteritems():
-
-        pkgs = updates_per_db.get(db_name)
-        if pkgs is None: continue
-        
-        db_file = os.path.join(sync_db, db_file)
-        pkgs = read_incoming_desc(pkgs, db_name, db_file)
-        updates_desc.update(pkgs)
-
-    #print updates_desc
-
-
-    # going to iterate to db update.
-    for pkg in to_update:
-        desc     = updates_desc[pkg][1]
-        filename = desc['FILENAME'][0]
-        db_name  = db_packages[pkg][2]
-        md5sum_expected = desc['MD5SUM'][0]
-
-        # build source & target.
-        source_url =  '%s/%s/os/x86_64/%s' % (url_download, db_name, filename)
-        target_url = '%s/%s' % (cache_dir, filename)
-
-        # download
-        download_package(source_url, target_url, md5sum = md5sum_expected)
-
-        # note we should check if md5sum are valid.
-
-
-        # uncompress xz into temporary directory.
-        tmp_dir = uncompress_archive(target_url)
-        print pkg, tmp_dir
-        
-        # rewrite rpath and other files.
-        rewrite_path(tmp_dir, "/home/jol/tmp/rlarch.test")
-
-        # uninstall previous package.
-
-        # copy file.
