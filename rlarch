@@ -11,18 +11,26 @@ import fileinput
 import struct
 
 # should have a pacman.conf reader.
-root      ="/"
-db_path   = os.path.join(root, 'var/lib/pacman')
-local_db  = os.path.join(db_path, 'local')
-sync_db   = os.path.join(db_path, 'sync')
-
-cache_dir = os.path.join(root, 'var/cache/pacman/pkg')
-
 url_download = 'http://mir.archlinux.fr'
 
-databases = {'core' : 'core.db',
-             'extra': 'extra.db',
-             'community': 'community.db'}
+class EnvDir:
+    """
+    Just a container for directory variables.
+    """
+    def __init__(self, prefix):
+        """
+        Setup variables
+        """
+        self.prefix = prefix
+        self.db_path   = os.path.join(self.prefix, 'var/lib/pacman')
+        self.local_db  = os.path.join(self.db_path, 'local')
+        self.sync_db   = os.path.join(self.db_path, 'sync')
+        self.cache_dir = os.path.join(self.prefix, 'var/cache/pacman/pkg')
+
+    def create(self):
+        for p in (self.prefix, self.db_path, self.local_db, 
+                  self.sync_db, self.cache_dir):
+            if not os.path.exists(p): os.makedirs(p)
 
 
 def setup_vars(prefix):
@@ -30,11 +38,7 @@ def setup_vars(prefix):
     global sync_db, cache_dir
 
     root = prefix
-    db_path   = os.path.join(root, 'var/lib/pacman')
-    local_db  = os.path.join(db_path, 'local')
-    sync_db   = os.path.join(db_path, 'sync')
-    cache_dir = os.path.join(root, 'var/cache/pacman/pkg')
-
+    
 
 def parse_local_desc(fd):
     """
@@ -53,7 +57,7 @@ def parse_local_desc(fd):
     return result
 
 
-def detect_installed_packages(local_db_path):
+def detect_installed_packages(env_dir):
     """
     @param local_db_path: the local db path.
     @return a map indexed by package name. Value
@@ -61,12 +65,12 @@ def detect_installed_packages(local_db_path):
     """
     # detect installed package.
     installed_db = {} # indexed by program name.
-    for soft in os.listdir(local_db_path):
+    for soft in os.listdir(env_dir.local_db):
         name, version, revision = soft.rsplit('-', 2)
         version = pkg_resources.parse_version(version + "-" + revision)
         # read depends.
-        descr = os.path.join(local_db,
-                            soft, 'desc')
+        descr = os.path.join(env_dir.local_db,
+                             soft, 'desc')
         descr = parse_local_desc(open(descr))
         installed_db[name] = (version, descr)
     
@@ -99,7 +103,7 @@ def read_incoming_database(db_name, incoming_db_filename):
     return result
 
 
-def read_databases(databases, db_path):
+def read_databases(databases, env_dir):
     """
     Read incoming database
     @param databases: array of databases
@@ -110,7 +114,7 @@ def read_databases(databases, db_path):
     # read all databases defined in databases variable.
     db_packages = {}
     for db_name in databases:
-        db_file = os.path.join(sync_db, db_name + '.db')
+        db_file = os.path.join(env_dir.sync_db, db_name + '.db')
         pkgs = read_incoming_database(db_name, db_file)
         db_packages.update(pkgs)
         
@@ -146,6 +150,29 @@ def read_incoming_desc(packages, db_name, incoming_db_filename):
     return result
     
 
+def read_descriptions(packages, databases, db_packages, env_dir):
+    """
+    Read all descriptions.
+    """
+    # group per database
+    updates_per_db = {}
+    for name in packages:
+        pkg = db_packages[name]
+        updates_per_db.setdefault(pkg[2], []).append(name)
+
+
+    # load descriptions.
+    descriptions = {}
+    for db_name in config.databases:
+
+        pkgs = updates_per_db.get(db_name)
+        if pkgs is None: continue
+        
+        db_file = os.path.join(env_dir.sync_db, db_name + '.db')
+        pkgs = read_incoming_desc(pkgs, db_name, db_file)
+        descriptions.update(pkgs)
+
+    return descriptions
 
 def _order_packages_to_update(update_packages,
                               installed_packages,
@@ -241,15 +268,16 @@ def download_package(source, target, md5sum=None):
     retcode = subprocess.call(["/usr/bin/wget", "-c", "-O", target, source ])
     
 
-def download_databases(from_url, databases, target_dir):
+def download_databases(from_url, databases, env_dir):
     """
     Download databases to the directory.
     """
     # url: http://.../database/os/arch/database.db
     for db in databases:
-        #python 3: os.uname().machine
+        #TODO: python 3: os.uname().machine
         db_url = '%s/%s/os/%s/%s.db' % (from_url, db, os.uname()[4], db)
-        db_target = '%s/%s.db' % (target_dir, db)
+        db_target = '%s/%s.db' % (env_dir.sync_db, db)
+        
         download_package(db_url, db_target)
 
 
@@ -397,14 +425,21 @@ def _merge_directory(source_dir, target_dir):
         'var/lock'
     ]]
 
+    installed_files = []
+    len_target_dir = len(target_dir) + 1
     for src_dir, dirs, files in os.walk(source_dir):
         dst_dir = src_dir.replace(source_dir, target_dir)
         
         if not os.path.exists(dst_dir):
             os.mkdir(dst_dir)
         for file_ in files:
+        
+            
             src_file = os.path.join(src_dir, file_)
             dst_file = os.path.join(dst_dir, file_)
+            
+            installed_files.append(dst_file[len_target_dir:])
+
             if os.path.exists(dst_file):
                 os.remove(dst_file)
             
@@ -413,25 +448,29 @@ def _merge_directory(source_dir, target_dir):
                 shutil.copy2(src_file, dst_dir)
             except Exception, e:
                 print "+++ failed to copy file: ", src_file
+    
+    return installed_files
+
 
 def update_packages(packages, descriptions, 
                     installed_packages, db_packages, 
-                    url, cache_dir, root_dir):
-
-    # make sure that the cache directory exists
-    # TODO: we should move this part.
-    if not os.path.exists(cache_dir): os.makedirs(cache_dir)
+                    url, env_dir):
 
 
     for pkg in to_update:
         desc     = descriptions[pkg][1]
         filename = desc['FILENAME'][0]
+        db_version = desc['VERSION'][0]
+
         db_name  = db_packages[pkg][2]
+        db_depends = db_packages[pkg][1]
+        
+
         md5sum_expected = desc['MD5SUM'][0]
 
         # build source & target.
         source_url =  '%s/%s/os/x86_64/%s' % (url, db_name, filename)
-        target_url = '%s/%s' % (cache_dir, filename)
+        target_url = '%s/%s' % (env_dir.cache_dir, filename)
 
         # download
         download_package(source_url, target_url, md5sum = md5sum_expected)
@@ -442,18 +481,23 @@ def update_packages(packages, descriptions,
         tmp_dir = uncompress_archive(target_url)
         
         # rewrite rpath and other files.
-        rewrite_path(tmp_dir, root_dir)
+        rewrite_path(tmp_dir, env_dir.prefix)
 
         # uninstall previous package.
         if pkg in installed_packages:
             print "+++ we have to uninstall", pkg
 
         # copy file.
-        _merge_directory(tmp_dir, root_dir)
+        installed_files = _merge_directory(tmp_dir, env_dir.prefix)
 
+        print "+++ package: %s-%s" % (pkg, db_version)
+        print "+++", desc
+        print "+++", db_depends
         # should destroy the temporary directory.
 
+
         # generate local save.
+
 
 
 def params():
@@ -532,29 +576,26 @@ if __name__ == '__main__':
         print "the environnement '%s' does not exist, you have to bootstrap it." % (config.env)
         sys.exit(1)
 
-    setup_vars(config.env) 
+    env_dir = EnvDir(config.env)
 
     if config.create_env:
-        for d in [local_db, sync_db, cache_dir]:
-            if not os.path.exists(d):
-                os.makedirs(d)
+        env_dir.create()
 
 
     # synchronize stuff
     if config.synchronize:
         if config.fetch_db:
             # make sure that the target dictionary exists.
-            if not os.path.exists(sync_db): os.makedirs(sync_db)
             print "going to synchronize database."
-            download_databases(config.from_url, config.databases, sync_db)
+            download_databases(config.from_url, config.databases, env_dir)
 
         if config.upgrade:
             # list installed packages
-            installed_packages = detect_installed_packages(local_db)
+            installed_packages = detect_installed_packages(env_dir)
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
-            available_packages = read_databases(config.databases, sync_db)
+            available_packages = read_databases(config.databases, env_dir)
 
             # determine which package to update.
             to_update, _ = update_installed_package(installed_packages,
@@ -562,45 +603,32 @@ if __name__ == '__main__':
 
             # prepare download.
         
-        if len(packages):
+        if len(packages):   
             # split packages and make an empty vertion.
             packages_to_install = {}
-            for p in packages: packages_to_install[p] = pkg_resources.parse_version('0.0.0')
+            for p in packages: 
+                packages_to_install[p] = pkg_resources.parse_version('0.0.0')
 
             # read installed packages.
-            installed_packages = detect_installed_packages(local_db)
+            installed_packages = detect_installed_packages(env_dir)
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
             print "reading databases:", config.databases
-            db_packages = read_databases(config.databases, sync_db)
+            db_packages = read_databases(config.databases, env_dir)
 
             # determine which package to update.
             to_update, _ = update_installed_package(packages_to_install,
                                                     db_packages)
 
+
             print "reading description for: ", to_update
-
-            # group per database
-            updates_per_db = {}
-            for name in to_update:
-                pkg = db_packages[name]
-                updates_per_db.setdefault(pkg[2], []).append(name)
-
-
-            # load descriptions.
-            descriptions = {}
-            for db_name in config.databases:
-
-                pkgs = updates_per_db.get(db_name)
-                if pkgs is None: continue
-        
-                db_file = os.path.join(sync_db, db_name + '.db')
-                pkgs = read_incoming_desc(pkgs, db_name, db_file)
-                descriptions.update(pkgs)
+            descriptions = read_descriptions(to_update, config.databases,
+                                             db_packages, env_dir)
 
             # update packages.
-            if not os.path.exists(cache_dir): os.makedirs(cachedir)
             update_packages(to_update, descriptions, 
                             installed_packages, db_packages,
-                            config.from_url, cache_dir, config.env)            
+                            config.from_url, env_dir)            
+
+
