@@ -33,17 +33,11 @@ class EnvDir:
             if not os.path.exists(p): os.makedirs(p)
 
 
-def setup_vars(prefix):
-    global root, db_path, local_db
-    global sync_db, cache_dir
-
-    root = prefix
-    
-
-def parse_local_desc(fd):
+def _parse_package(fd):
     """
-    Parse local description of a package.
-    @param filename: the filename of description.
+    Parse a package file descriptor. 
+    @param fd:   the file descriptor from where we read data.
+    @return map of category. Each category contains a vector.
     """
     result = {}
     current_cat = ''
@@ -57,31 +51,11 @@ def parse_local_desc(fd):
     return result
 
 
-def detect_installed_packages(env_dir):
+def _read_database(db_name, incoming_db_filename):
     """
-    @param local_db_path: the local db path.
-    @return a map indexed by package name. Value
-    are a tuple (version, revision, description_map)
-    """
-    # detect installed package.
-    installed_db = {} # indexed by program name.
-    for soft in os.listdir(env_dir.local_db):
-        name, version, revision = soft.rsplit('-', 2)
-        version = pkg_resources.parse_version(version + "-" + revision)
-        # read depends.
-        descr = os.path.join(env_dir.local_db,
-                             soft, 'desc')
-        descr = parse_local_desc(open(descr))
-        installed_db[name] = (version, descr)
-    
-    return installed_db
+    Read a database.
 
-
-def read_incoming_database(db_name, incoming_db_filename):
-    """
-    Read the incoming database filename.
-
-    @return a map indexed by package name.
+    @return a map<package name, (version, depends, db_name)>.
     """
     import tarfile, zlib
 
@@ -97,35 +71,23 @@ def read_incoming_database(db_name, incoming_db_filename):
         # extract depends information.
         elif tarinfo.isfile():
             if "/depends" in tarinfo.name:
-                depends = parse_local_desc(tar.extractfile(tarinfo))
+                depends = _parse_package(tar.extractfile(tarinfo))
                 result[name] = (version, depends, db_name)
         
     return result
 
-
-def read_databases(databases, env_dir):
+def _read_descs_from_db(packages, db_name, incoming_db_filename):
     """
-    Read incoming database
-    @param databases: array of databases
-    @param db_path: directory where to find the read databases.
+    Read description for all packages from the database.
+    We open the data using tar and we browse it.
     
-    @return a map indexed by package name.
-    """
-    # read all databases defined in databases variable.
-    db_packages = {}
-    for db_name in databases:
-        db_file = os.path.join(env_dir.sync_db, db_name + '.db')
-        pkgs = read_incoming_database(db_name, db_file)
-        db_packages.update(pkgs)
-        
-    return db_packages
+    Once we found a requested package, we read the desc file.
 
+    @param packages: a set of packages.
+    @param dn_name: the name of the database.
+    @param incoming_db_filename: the database filepath.
 
-def read_incoming_desc(packages, db_name, incoming_db_filename):
-    """
-    Read the description from the incoming database.
-    The description are limited to the packages set
-    passed by parameter.
+    @return a map<pkgname, (version, desc, db_name)>
     """
     import tarfile, zlib
 
@@ -144,11 +106,54 @@ def read_incoming_desc(packages, db_name, incoming_db_filename):
             if name  not in packages: continue
             
             if "/desc" in tarinfo.name:
-                desc = parse_local_desc(tar.extractfile(tarinfo))
+                desc = _parse_package(tar.extractfile(tarinfo))
                 result[name] = (version, desc, db_name)
         
     return result
+
+
+
+
+def read_installed_packages(env_dir):
+    """
+    @param local_db_path: the local db path.
+    @return a map indexed by package name. Value
+    are a tuple (version, revision, description_map)
+    """
+    # detect installed package.
+    installed_db = {} # indexed by program name.
+    for soft in os.listdir(env_dir.local_db):
+        name, version, revision = soft.rsplit('-', 2)
+        version = pkg_resources.parse_version(version + "-" + revision)
+        # read depends.
+        descr = os.path.join(env_dir.local_db,
+                             soft, 'desc')
+        descr = _parse_package(open(descr))
+        installed_db[name] = (version, descr)
     
+    return installed_db
+
+
+
+def read_databases(databases, env_dir):
+    """
+    Read databases passed by parameter.
+    
+    @param databases: array of databases
+    @param env_dir: variable with all available path.
+    
+    @return a map<pkg name, (version, depends, db_name)>
+    """
+    # read all databases defined in databases variable.
+    db_packages = {}
+    for db_name in databases:
+        db_file = os.path.join(env_dir.sync_db, db_name + '.db')
+        pkgs = _read_database(db_name, db_file)
+        db_packages.update(pkgs)
+        
+    return db_packages
+
+
 
 def read_descriptions(packages, databases, db_packages, env_dir):
     """
@@ -158,8 +163,7 @@ def read_descriptions(packages, databases, db_packages, env_dir):
     updates_per_db = {}
     for name in packages:
         pkg = db_packages[name]
-        updates_per_db.setdefault(pkg[2], []).append(name)
-
+        updates_per_db.setdefault(pkg[2], set()).add(name)
 
     # load descriptions.
     descriptions = {}
@@ -169,10 +173,12 @@ def read_descriptions(packages, databases, db_packages, env_dir):
         if pkgs is None: continue
         
         db_file = os.path.join(env_dir.sync_db, db_name + '.db')
-        pkgs = read_incoming_desc(pkgs, db_name, db_file)
+        pkgs = _read_descs_from_db(pkgs, db_name, db_file)
         descriptions.update(pkgs)
 
     return descriptions
+
+
 
 def _order_packages_to_update(update_packages,
                               installed_packages,
@@ -247,6 +253,16 @@ def update_installed_package(installed_packages,
                                                    installed_packages,
                                                    db_packages)
     return packages_to_update, packages_missing
+
+
+def determine_package_to_update(packages, installed_packages, db_packages):
+    """
+    Determine which package to install based on their dependencies.
+    @param packages: an of package name to install.
+    @param installed_packages: packages already installed on the system.
+    @param db_packages: available packages from db.
+    """
+
 
 
 def download_package(source, target, md5sum=None):
@@ -452,6 +468,35 @@ def _merge_directory(source_dir, target_dir):
     return installed_files
 
 
+def insert_to_local_db(package, version, descr,
+                       depends, files, env_dir):
+    # remove the directory if it does not exists.
+    pkgver = "%s-%s" % (package, version)
+
+    target_dir = os.path.join(env_dir.local_db, pkgver)
+    if os.path.exists(target_dir):
+        shutil.rmtree(target_dir)
+
+    # create directory.
+    os.makedirs(target_dir)
+
+    descr.update(depends)
+
+    # generate desc file.
+    f = open(os.path.join(target_dir, 'desc'), 'w')
+    for key, lines in descr.iteritems():
+        f.write('%%%s%%\n' % (key))
+        for line in lines:
+            f.write(line + '\n')
+    f.close()
+
+    # write files
+    f = open(os.path.join(target_dir, 'files'), 'w')
+    for file in files:
+        f.write(file + '\n')
+    f.close()
+
+
 def update_packages(packages, descriptions, 
                     installed_packages, db_packages, 
                     url, env_dir):
@@ -481,7 +526,8 @@ def update_packages(packages, descriptions,
         tmp_dir = uncompress_archive(target_url)
         
         # rewrite rpath and other files.
-        rewrite_path(tmp_dir, env_dir.prefix)
+        if pkg != 'glibc':
+            rewrite_path(tmp_dir, env_dir.prefix)
 
         # uninstall previous package.
         if pkg in installed_packages:
@@ -490,14 +536,11 @@ def update_packages(packages, descriptions,
         # copy file.
         installed_files = _merge_directory(tmp_dir, env_dir.prefix)
 
-        print "+++ package: %s-%s" % (pkg, db_version)
-        print "+++", desc
-        print "+++", db_depends
         # should destroy the temporary directory.
 
-
         # generate local save.
-
+        insert_to_local_db(pkg, db_version, desc, db_depends,
+                           installed_files, env_dir)
 
 
 def params():
@@ -591,7 +634,7 @@ if __name__ == '__main__':
 
         if config.upgrade:
             # list installed packages
-            installed_packages = detect_installed_packages(env_dir)
+            installed_packages = read_installed_packages(env_dir)
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
@@ -610,15 +653,17 @@ if __name__ == '__main__':
                 packages_to_install[p] = pkg_resources.parse_version('0.0.0')
 
             # read installed packages.
-            installed_packages = detect_installed_packages(env_dir)
+            installed_packages = read_installed_packages(env_dir)
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
             print "reading databases:", config.databases
             db_packages = read_databases(config.databases, env_dir)
 
+
             # determine which package to update.
             to_update, _ = update_installed_package(packages_to_install,
+                                                    installed_packages,
                                                     db_packages)
 
 
