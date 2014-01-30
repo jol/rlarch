@@ -303,7 +303,7 @@ def _compute_packages_order(update_packages,
         deps = db_pkg[1].get('DEPENDS')
         if deps is None:
             # only append if a new version is available.
-            if db_packages[name][0] > installed_packages[name][0]:
+            if name not in installed_packages or db_packages[name][0] > installed_packages[name][0]:
                 tmp.append(name)
                 already_scheduled[name] = 1
             continue
@@ -412,7 +412,7 @@ def download_package(source, target, md5sum=None):
     print("downloading: ", source, target)
     retcode = subprocess.call(["/usr/bin/wget", "--progress=bar", "-c", "-O",
                                 target, source ])
-    return recode == 0
+    return retcode == 0
 
 
 def download_databases(from_url, databases, env_dir):
@@ -460,7 +460,7 @@ def uncompress_archive(filename):
 
 
 
-def rewrite_path(package_dir, new_root_path):
+def rewrite_path(package_dir, new_root_path, text_only = False):
     """
     @param package_dir: the package directory.
     @param new_root_path: the root path used to rewrite
@@ -486,7 +486,8 @@ def rewrite_path(package_dir, new_root_path):
         if count: count_text_modified += 1
     #print "number of rewritten text file:", count_text_modified
     
-
+    if text_only: return
+    
     # now patch binary file, find all elf file inside
     # a directory. once found, execute the patchelf command
     elf_files = _list_elf_files(package_dir)
@@ -567,15 +568,12 @@ def update_packages(packages, descriptions,
                     url, env_dir):
 
 
-    for pkg in to_update:
+    for i, pkg in enumerate(to_update):
         desc     = descriptions[pkg][1]
         filename = desc['FILENAME'][0]
         db_version = desc['VERSION'][0]
-
         db_name  = db_packages[pkg][2]
         db_depends = db_packages[pkg][1]
-        
-
         md5sum_expected = desc['MD5SUM'][0]
 
         # build source & target.
@@ -583,16 +581,30 @@ def update_packages(packages, descriptions,
         target_url = '%s/%s' % (env_dir.cache_dir, filename)
 
         # download
+        print "downloading %s (%d/%d)" % (pkg, i + 1, len(to_update))
         download_package(source_url, target_url, md5sum = md5sum_expected)
 
         # note we should check if md5sum are valid.
 
+    for pkg in to_update:
+
+        desc     = descriptions[pkg][1]
+        filename = desc['FILENAME'][0]
+        db_version = desc['VERSION'][0]
+        db_name  = db_packages[pkg][2]
+        db_depends = db_packages[pkg][1]
+        md5sum_expected = desc['MD5SUM'][0]
+
+        # build source & target.
+        source_url =  '%s/%s/os/x86_64/%s' % (url, db_name, filename)
+        target_url = '%s/%s' % (env_dir.cache_dir, filename)
+        
+    
         # uncompress xz into temporary directory.
         tmp_dir = uncompress_archive(target_url)
         
         # rewrite rpath and other files.
-        if pkg != 'glibc':
-            rewrite_path(tmp_dir, env_dir.prefix)
+        rewrite_path(tmp_dir, env_dir.prefix, pkg in ('glib',))
 
         # uninstall previous package.
         if pkg in installed_packages:
@@ -668,6 +680,31 @@ def params():
     return config, args
 
 
+def getch():
+  import termios
+  import fcntl
+  import sys
+  fd = sys.stdin.fileno()
+
+  oldterm = termios.tcgetattr(fd)
+  newattr = termios.tcgetattr(fd)
+  newattr[3] = newattr[3] & ~termios.ICANON & ~termios.ECHO
+  termios.tcsetattr(fd, termios.TCSANOW, newattr)
+
+  oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
+  fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+
+  try:        
+    while 1:            
+      try:
+        c = sys.stdin.read(1)
+        break
+      except IOError: pass
+  finally:
+    termios.tcsetattr(fd, termios.TCSAFLUSH, oldterm)
+    fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
+  return c
+
 if __name__ == '__main__':
 
     # create parser
@@ -722,14 +759,12 @@ if __name__ == '__main__':
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
-            print("reading databases:", config.databases)
             db_packages = read_databases(config.databases, env_dir)
 
             # determine which package to update.
             to_update, missing = determine_package_to_install(packages_to_install.keys(),
                                                               installed_packages,
                                                               db_packages)
-
             if len(missing):
                 print "missing packages are: ", missing
             
@@ -737,6 +772,23 @@ if __name__ == '__main__':
             descriptions = read_descriptions(to_update,
                                              db_packages, env_dir)
 
+            print "-" * 62
+            print "%-40s %10s %10s" % ("Package", "Cur Vers", "New Vers")
+            for pkg in to_update:
+                inst_pkg = installed_packages.get(pkg)
+                db_pkg   = descriptions.get(pkg)
+                inst_version = None
+                if inst_pkg: inst_version = inst_pkg[1].get('VERSION')[0]
+                db_version = db_pkg[1].get('VERSION')[0]
+                print "%-40s %10s %10s" % (pkg, inst_version, db_version)
+
+            print "-" * 62
+            print "do you want to continue ? (y/n): ",
+            answer = getch()
+            if answer != 'y':
+                print "leaving ..."
+                sys.exit(1)
+                
             # update packages.
             update_packages(to_update, descriptions, 
                             installed_packages, db_packages,
