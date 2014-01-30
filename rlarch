@@ -680,6 +680,19 @@ def params():
     return config, args
 
 
+def display_update(packages, installed_packages, descriptions):
+    print "-" * 62
+    print "%-40s %10s %10s" % ("Package", "Cur Vers", "New Vers")
+    for pkg in to_update:
+        inst_pkg = installed_packages.get(pkg)
+        db_pkg   = descriptions.get(pkg)
+        inst_version = None
+        if inst_pkg: inst_version = inst_pkg[1].get('VERSION')[0]
+        db_version = db_pkg[1].get('VERSION')[0]
+        print "%-40s %10s %10s" % (pkg, inst_version, db_version)
+    print "-" * 62
+    
+
 def getch():
   import termios
   import fcntl
@@ -704,6 +717,8 @@ def getch():
     termios.tcsetattr(fd, termios.TCSAFLUSH, oldterm)
     fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
   return c
+
+
 
 if __name__ == '__main__':
 
@@ -740,20 +755,34 @@ if __name__ == '__main__':
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
-            available_packages = read_databases(config.databases, env_dir)
+            db_packages = read_databases(config.databases, env_dir)
 
             # determine which package to update.
-            to_update, _ = update_installed_package(installed_packages,
-                                                    available_packages)
+            to_update, _ = determine_package_to_update(installed_packages,
+                                                       db_packages)
 
-            # prepare download.
+            print("reading description for: ", to_update)
+            descriptions = read_descriptions(to_update,
+                                             db_packages, env_dir)
+
+            if len(to_update) == 0:
+                print "nothing to do"
+                sys.exit(0)
+                
+            display_update(to_update, installed_packages, descriptions)
+            print "do you want to make the update ? (y/n): ",
+            answer = getch()
+            if answer != 'y':
+                print "leaving ..."
+                sys.exit(1)
+            
+            # make the update.
+            update_packages(to_update, descriptions, 
+                            installed_packages, db_packages,
+                            config.from_url, env_dir)            
         
         if len(packages):   
-            # build a list of wanted package to install.
-            packages_to_install = {}
-            for p in packages: 
-                packages_to_install[p] = pkg_resources.parse_version('0.0.0')
-
+            
             # read installed packages.
             installed_packages = read_installed_packages(env_dir)
             print("nb installed packages: ", len(installed_packages))
@@ -762,7 +791,7 @@ if __name__ == '__main__':
             db_packages = read_databases(config.databases, env_dir)
 
             # determine which package to update.
-            to_update, missing = determine_package_to_install(packages_to_install.keys(),
+            to_update, missing = determine_package_to_install(packages,
                                                               installed_packages,
                                                               db_packages)
             if len(missing):
@@ -772,17 +801,7 @@ if __name__ == '__main__':
             descriptions = read_descriptions(to_update,
                                              db_packages, env_dir)
 
-            print "-" * 62
-            print "%-40s %10s %10s" % ("Package", "Cur Vers", "New Vers")
-            for pkg in to_update:
-                inst_pkg = installed_packages.get(pkg)
-                db_pkg   = descriptions.get(pkg)
-                inst_version = None
-                if inst_pkg: inst_version = inst_pkg[1].get('VERSION')[0]
-                db_version = db_pkg[1].get('VERSION')[0]
-                print "%-40s %10s %10s" % (pkg, inst_version, db_version)
-
-            print "-" * 62
+            display_update(to_update, installed_packages, descriptions)
             print "do you want to continue ? (y/n): ",
             answer = getch()
             if answer != 'y':
