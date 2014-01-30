@@ -48,3 +48,7 @@ Requirements:
 * xz utils
 * patchelf from NixOs project (http://nixos.org/patchelf.html)
 * Python version 2.7 (do not work for now wyth Python 3.3)
+
+Packages
+--------
+* valgrind: you have to export  VALGRIND_LIB=$RLARCH_PREFIX/usr/lib/valgrind
