@@ -112,6 +112,95 @@ def _read_descs_from_db(packages, db_name, incoming_db_filename):
     return result
 
 
+def _file_replace_inplace(filename, replaces):
+    """
+    Make a replace inplace in a file.
+    @param filename: the filename that will be updated.
+    @param search: the search pattern.
+    @param replace: the replace Value
+    @return the number of line changed.
+    """
+    count = 0
+    for line in fileinput.input(filename, inplace=1):
+        
+        for r in replaces:
+            if r[0] in line:
+                line = line.replace(r[0], r[1])
+                count += 1
+        sys.stdout.write(line)
+            
+    return count
+
+
+def _is_elf_file(filename):
+    """
+    Check if the file is an ELF file.
+    Read only the first 4 bytes.
+    
+    @param filename: the filename to test.
+    @return True on success.
+    """
+    if os.path.getsize(filename) < 4: return False
+    f = open(filename, 'rb')
+    header = struct.unpack('4c', f.read(4))
+    return ('\x7f', 'E', 'L', 'F') == header
+
+
+def _list_elf_files(dirname):
+    """
+    List all elf file present in the hierarchy.
+    @param dirname: the directory name to browse.
+    @return a list of absolute elf file path.
+    """
+    def _over(arg, dirname, fnames):
+        for f in fnames:
+            p = os.path.join(dirname, f)
+            if not os.path.isfile(p): continue
+            if _is_elf_file(p):
+                arg.append(p)
+    tmp = []
+    os.path.walk(dirname, _over, tmp)
+    return tmp
+
+
+def _patch_elf_file(filename, new_root_path, replaces):
+    """
+    Call patchelft program to path the el file.
+    We change the run path and the set interpreter.
+
+    @param filename: the absolute path of the file to patch.
+    @param new_root_path: the new root path used to set the run path.
+    @param replaces: a vector containing what we have to replace in the rpath.
+    """
+    # TODO: we could put this stuff outside.
+    mandatory_rpath = [os.path.join(new_root_path, p) for p in ['usr/lib', 'usr/local/lib', 'lib']]
+    mandatory_rpath = ':'.join(mandatory_rpath)
+
+    # get current rpath
+    cmds = ["patchelf", "--print-rpath", filename]
+    try:
+        # get rpath and change it.
+        rpath = subprocess.check_output(cmds)
+
+        # we should add other rpath: /usr/lib:/usr/local/lib:/lib
+        for r in replaces:
+            rpath = rpath.replace(r[0], r[1])
+        rpath = '%s:%s' % (rpath.replace('\n', ''), mandatory_rpath)
+
+        # set rpath
+        cmds = ["patchelf", "--set-rpath", rpath, filename]
+        retcode = subprocess.call(cmds)
+
+        # set interpreter
+        cmds = ["patchelf", "--set-interpreter",
+                os.path.join(new_root_path, "usr/lib/ld-linux-x86-64.so.2"), filename]
+        retcode = subprocess.call(cmds)
+                    
+    except Exception, e:
+        return False
+    
+    return True
+
 
 
 def read_installed_packages(env_dir):
@@ -155,11 +244,17 @@ def read_databases(databases, env_dir):
 
 
 
-def read_descriptions(packages, databases, db_packages, env_dir):
+def read_descriptions(packages, db_packages, env_dir):
     """
-    Read all descriptions.
+    Read description from databases for a set of packages.
+
+    @param packages: a set of packages for which we want descriptions.
+    @param databases: an array of database name.
+    @param db_packages:
+
+    @return a map<pkgname, (version, desc, db_name)>
     """
-    # group per database
+    # group packages per database.
     updates_per_db = {}
     for name in packages:
         pkg = db_packages[name]
@@ -167,11 +262,8 @@ def read_descriptions(packages, databases, db_packages, env_dir):
 
     # load descriptions.
     descriptions = {}
-    for db_name in config.databases:
+    for db_name, pkgs in updates_per_db.iteritems():
 
-        pkgs = updates_per_db.get(db_name)
-        if pkgs is None: continue
-        
         db_file = os.path.join(env_dir.sync_db, db_name + '.db')
         pkgs = _read_descs_from_db(pkgs, db_name, db_file)
         descriptions.update(pkgs)
@@ -180,15 +272,14 @@ def read_descriptions(packages, databases, db_packages, env_dir):
 
 
 
-def _order_packages_to_update(update_packages,
-                              installed_packages,
-                              db_packages,
-                              already_scheduled = {}
-                              ):
+def _compute_packages_order(update_packages,
+                            installed_packages,
+                            db_packages,
+                            already_scheduled = {}
+                            ):
     """
-    Order Packages in to a vector depends on
-    their dependency, moreover, it will add required
-    packages.
+    Compute packages order for the install process. It
+    will add required dependency to the list.
     """
     tmp = []
     for name in update_packages:
@@ -201,27 +292,32 @@ def _order_packages_to_update(update_packages,
         # check if already scheduled
         if name in already_scheduled: continue
         
-        # get depends
+        # check if the package is available in the
+        # database.
         db_pkg = db_packages.get(name)
         if db_pkg is None: continue
-        
+
+        # get dependencies of the package. If they are
+        # not available only append the package to the
+        # tmp list.
         deps = db_pkg[1].get('DEPENDS')
         if deps is None:
-            tmp.append(name)
-            already_scheduled[name] = 1
+            # only append if a new version is available.
+            if db_packages[name][0] > installed_packages[name][0]:
+                tmp.append(name)
+                already_scheduled[name] = 1
             continue
         
         # process dependencies.
-        tmp += _order_packages_to_update(deps,
-                                         installed_packages,
-                                         db_packages,
-                                         already_scheduled)
+        tmp += _compute_packages_order(deps,
+                                       installed_packages,
+                                       db_packages,
+                                       already_scheduled)
 
         # the current name
         if name in already_scheduled:
             print("strange: '%s' should not be already in the queue" % (name))
             continue
-
         
         # compare the version between installed 
         if name not in installed_packages or \
@@ -233,11 +329,18 @@ def _order_packages_to_update(update_packages,
     return tmp
 
 
-def update_installed_package(installed_packages,
-                             db_packages):
+def determine_package_to_update(installed_packages,
+                                db_packages):
     """
+    Determine which package to update. We take the list
+    of installed packages, and check if a new version is available.
+
+    @param installed_packages: a map of installed packages.
+    @param db_packages: the list of database packages.
+    
     @return a tuple of (update or install pkgs, no present in db)
     """
+    # first step is to check which packages we have to update. 
     packages_to_update = []
     packages_missing = []
     for name, oldpkg in installed_packages.iteritems():
@@ -245,28 +348,54 @@ def update_installed_package(installed_packages,
         npkg = db_packages.get(name)
         if npkg is None:
             packages_missing.append(name)
+
+        # if a new version is available, append it to the
+        # package to install.
         elif npkg[0] > oldpkg[0]:
             packages_to_update.append(name)
 
     # order packages.
-    packages_to_update = _order_packages_to_update(packages_to_update,
-                                                   installed_packages,
-                                                   db_packages)
+    packages_to_update = _compute_packages_order(packages_to_update,
+                                                 installed_packages,
+                                                 db_packages)
     return packages_to_update, packages_missing
 
 
-def determine_package_to_update(packages, installed_packages, db_packages):
+def determine_package_to_install(packages, installed_packages,
+                                 db_packages):
     """
-    Determine which package to install based on their dependencies.
-    @param packages: an of package name to install.
-    @param installed_packages: packages already installed on the system.
-    @param db_packages: available packages from db.
+    Determine which package to install. We dont care about the
+    presence of packages, we install it if the caller want it.
     """
+    packages_to_install = []
+    packages_missing    = []
 
+    for name in packages:
+        if name not in db_packages: packages_missing.append(name)
+        else: packages_to_install.append(name)
 
+    tmp = _compute_packages_order(packages_to_install,
+                                  installed_packages,
+                                  db_packages)
+    # force the install of requested packages even if the version
+    # has not changed.
+    packages_to_install = set(tmp + packages_to_install)
+    return packages_to_install, packages_missing
+    
 
 def download_package(source, target, md5sum=None):
+    """
+    Download a package
+    If a checksum is passed in parameter, we compute
+    a md5sum on the target file (if it exists). If the md5sum is not valid,
+    we erase the target and we start the download.
 
+    @param source: the uri of the source file.
+    @param target: the target file.
+    @param md5sum: optional checksum used to compare with the target md5sum.
+
+    @return True on success, False otherwise.
+    """
     #xfer_command = "/usr/bin/curl -C - -f %u > %o"
     # /usr/bin/wget --passive-ftp -c -O %o %u
     # download using curl.
@@ -276,25 +405,36 @@ def download_package(source, target, md5sum=None):
         compute_md5sum = output.split(' ')[0]
     
         if md5sum == compute_md5sum:
-            return 0
-        print "wrong checksum, deleting file: ", target
+            return True
+        print("wrong checksum, deleting file: ", target)
         os.unlink(target)
     
-    print "downloading: ", source, target    
-    retcode = subprocess.call(["/usr/bin/wget", "-c", "-O", target, source ])
-    
+    print("downloading: ", source, target)
+    retcode = subprocess.call(["/usr/bin/wget", "--progress=bar", "-c", "-O",
+                                target, source ])
+    return recode == 0
+
 
 def download_databases(from_url, databases, env_dir):
     """
-    Download databases to the directory.
+    Download a vector of databases
+
+    @param from_url: the url used to download databases.
+    @param databases: a set of databases.
+    @param env_dir: contains directory where to put the file.
+
+    @return True if all databases are downloaded correctly.
     """
-    # url: http://.../database/os/arch/database.db
+    # url format: http://.../database/os/arch/database.db
+    ret = True
     for db in databases:
         #TODO: python 3: os.uname().machine
         db_url = '%s/%s/os/%s/%s.db' % (from_url, db, os.uname()[4], db)
         db_target = '%s/%s.db' % (env_dir.sync_db, db)
         
-        download_package(db_url, db_target)
+        ret = True and download_package(db_url, db_target)
+
+    return ret
 
 
 def uncompress_archive(filename):
@@ -318,81 +458,7 @@ def uncompress_archive(filename):
     return tmp_dir
 
 
-def _file_replace_inplace(filename, replaces):
-    """
-    Make a replace inplace in a file.
-    @param filename: the filename that will be updated.
-    @param search: the search pattern.
-    @param replace: the replace Value
-    @return the number of line changed.
-    """
-    count = 0
-    for line in fileinput.input(filename, inplace=1):
-        
-        for r in replaces:
-            if r[0] in line:
-                line = line.replace(r[0], r[1])
-                count += 1
-        sys.stdout.write(line)
-            
-    return count
 
-
-
-def _is_elf_file(filename):
-    """
-    Check if the file is an ELF file.
-    """
-    if os.path.getsize(filename) < 4: return False
-    f = open(filename, 'rb')
-    header = struct.unpack('4c', f.read(4))
-    return ('\x7f', 'E', 'L', 'F') == header
-
-
-
-def _list_elf_files(dirname):
-    """
-    List all elf file present in the hierarchy
-    """
-    def _over(arg, dirname, fnames):
-        for f in fnames:
-            p = os.path.join(dirname, f)
-            if not os.path.isfile(p): continue
-            if _is_elf_file(p):
-                arg.append(p)
-    tmp = []
-    os.path.walk(dirname, _over, tmp)
-    return tmp
-
-
-def _patch_elf_file(filename, new_root_path, replaces):
-    
-    # TODO: we could put this stuff outside.
-    mandatory_rpath = [os.path.join(new_root_path, p) for p in ['usr/lib', 'usr/local/lib', 'lib']]
-    mandatory_rpath = ':'.join(mandatory_rpath)
-
-    # get current rpath
-    cmds = ["patchelf", "--print-rpath", filename]
-    try:
-        # get rpath and change it.
-        rpath = subprocess.check_output(cmds)
-
-        # we should add other rpath: /usr/lib:/usr/local/lib:/lib
-        for r in replaces:
-            rpath = rpath.replace(r[0], r[1])
-        rpath = '%s:%s' % (rpath.replace('\n', ''), mandatory_rpath)
-
-        # set rpath
-        cmds = ["patchelf", "--set-rpath", rpath, filename]
-        retcode = subprocess.call(cmds)
-
-    except Exception, e:
-        #if not rpath.startswith('cannot find'):
-        #    print "failed to patch ELF file '%s'; error(%s)" % (filename, str(e))
-        #    return False
-        pass
-
-    return True
 
 def rewrite_path(package_dir, new_root_path):
     """
@@ -408,7 +474,6 @@ def rewrite_path(package_dir, new_root_path):
             "-exec", "grep", "-Il", ".", "{}", ";"]
     outputs = subprocess.check_output(cmds)
     
-    # use sed inplace to replace /usr by the new root path.
     to_replace = [
         ['/usr', os.path.join(new_root_path, 'usr')],
         ['/etc', os.path.join(new_root_path, 'etc')],
@@ -463,7 +528,7 @@ def _merge_directory(source_dir, target_dir):
             try:
                 shutil.copy2(src_file, dst_dir)
             except Exception, e:
-                print "+++ failed to copy file: ", src_file
+                print("+++ failed to copy file: ", src_file)
     
     return installed_files
 
@@ -610,13 +675,13 @@ if __name__ == '__main__':
 
     # make sure that environnement is defined.
     if config.env is None:
-        print "you have to define the prefix to use through the RLARCH_PREFIX variable or --env parameter."
+        print("you have to define the prefix to use through the RLARCH_PREFIX variable or --env parameter.")
         sys.exit(1)
 
     # make sure that the directory exists.
     # TODO: create a check env function that will ensure that basic requirements are present.
     if not os.path.exists(config.env):
-        print "the environnement '%s' does not exist, you have to bootstrap it." % (config.env)
+        print("the environnement '%s' does not exist, you have to bootstrap it." % (config.env))
         sys.exit(1)
 
     env_dir = EnvDir(config.env)
@@ -629,7 +694,7 @@ if __name__ == '__main__':
     if config.synchronize:
         if config.fetch_db:
             # make sure that the target dictionary exists.
-            print "going to synchronize database."
+            print("going to synchronize database.")
             download_databases(config.from_url, config.databases, env_dir)
 
         if config.upgrade:
@@ -647,7 +712,7 @@ if __name__ == '__main__':
             # prepare download.
         
         if len(packages):   
-            # split packages and make an empty vertion.
+            # build a list of wanted package to install.
             packages_to_install = {}
             for p in packages: 
                 packages_to_install[p] = pkg_resources.parse_version('0.0.0')
@@ -657,18 +722,19 @@ if __name__ == '__main__':
             print("nb installed packages: ", len(installed_packages))
 
             # read databases
-            print "reading databases:", config.databases
+            print("reading databases:", config.databases)
             db_packages = read_databases(config.databases, env_dir)
 
-
             # determine which package to update.
-            to_update, _ = update_installed_package(packages_to_install,
-                                                    installed_packages,
-                                                    db_packages)
+            to_update, missing = determine_package_to_install(packages_to_install.keys(),
+                                                              installed_packages,
+                                                              db_packages)
 
-
-            print "reading description for: ", to_update
-            descriptions = read_descriptions(to_update, config.databases,
+            if len(missing):
+                print "missing packages are: ", missing
+            
+            print("reading description for: ", to_update)
+            descriptions = read_descriptions(to_update,
                                              db_packages, env_dir)
 
             # update packages.
